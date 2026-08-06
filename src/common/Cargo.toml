@@ -53,6 +53,7 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 uaparser.workspace = true
 url.workspace = true
+urlencoding.workspace = true
 utoipa.workspace = true
 config.workspace = true
 infra.workspace = true

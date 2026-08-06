@@ -38,7 +38,7 @@ use openobserve_core::{
 use crate::common::{
     infra::config::ORG_INGESTION_TOKENS,
     meta::{
-        ingestion_routes,
+        ingestion_routes, read_only_routes,
         user::{
             AuthTokensExt, TokenValidationResponse, TokenValidationResponseBuilder,
             get_default_user_role,
@@ -118,6 +118,33 @@ pub struct AuthValidationResult {
     pub user_email: String,
     pub user_role: Option<UserRole>,
     pub is_internal_user: bool,
+}
+
+/// What a read-only account is told when it attempts a write.
+const READ_ONLY_DENIED: &str = "Read only account: this operation is not permitted";
+
+/// Should this authenticated request be refused because the account is read
+/// only?
+///
+/// Enterprise builds answer this with the OpenFGA model — every route carries a
+/// declared permission — so the helper is a no-op there. OSS builds have no
+/// authorization model behind the roles, so a `Viewer` (or the system-managed
+/// `SreAgent`) is held to the read-only route policy instead: safe methods, the
+/// declared query-by-POST routes, and self-service maintenance of its own
+/// account. Everything else, ingestion included, is refused.
+///
+/// This is checked on every authenticated request — password, session and
+/// static-token alike — rather than in the permission layer, because in OSS the
+/// `AuthExtractor` marks every request `bypass_check`, so the permission layer
+/// never runs.
+#[cfg(not(feature = "enterprise"))]
+fn read_only_denied(user: &User, method: &Method, path: &str) -> bool {
+    user.role.is_read_only() && !read_only_routes::is_request_allowed(method, path, &user.email)
+}
+
+#[cfg(feature = "enterprise")]
+fn read_only_denied(_user: &User, _method: &Method, _path: &str) -> bool {
+    false
 }
 
 /// Helper function to build a successful token validation response
@@ -523,6 +550,10 @@ pub async fn validate_credentials(
             });
         }
 
+        if read_only_denied(&user, method, path) {
+            return Err(AuthError::Forbidden(READ_ONLY_DENIED.to_string()));
+        }
+
         return Ok(build_token_validation_response(&user));
     }
 
@@ -550,6 +581,11 @@ pub async fn validate_credentials(
     // longer accepts a user's ingestion token). Service-account tokens, which
     // are valid across the API, are handled earlier and are unaffected.
     if is_ingestion_path && user.token.eq(&user_password) {
+        // A read-only account has no write path at all, so its token cannot
+        // ingest either.
+        if read_only_denied(&user, method, path) {
+            return Err(AuthError::Forbidden(READ_ONLY_DENIED.to_string()));
+        }
         return Ok(build_token_validation_response(&user));
     }
 
@@ -582,12 +618,9 @@ pub async fn validate_credentials(
         }
     }
     let in_pass = get_hash(user_password, &user.salt);
-    if !user.password.eq(&in_pass)
-        && !user
-            .password_ext
-            .unwrap_or("".to_string())
-            .eq(&user_password)
-    {
+    // `as_deref` rather than `unwrap()`: `user` is still needed below for the
+    // read-only check and the response, so the password must not be moved out.
+    if !user.password.eq(&in_pass) && user.password_ext.as_deref().unwrap_or("") != user_password {
         return Ok(TokenValidationResponse {
             is_valid: false,
             user_email: "".to_string(),
@@ -598,6 +631,15 @@ pub async fn validate_credentials(
             given_name: "".to_string(),
         });
     }
+
+    // Credentials are good — now decide whether this account may do this. The
+    // check sits after authentication on purpose: answering "403 read only"
+    // before the password is verified would tell an anonymous caller that the
+    // account exists and what role it holds.
+    if read_only_denied(&user, method, path) {
+        return Err(AuthError::Forbidden(READ_ONLY_DENIED.to_string()));
+    }
+
     if !path.contains("/user")
         || (path.contains("/user")
             && (user.role.eq(&UserRole::Admin)
@@ -1067,6 +1109,19 @@ pub async fn validator_rum(req_data: &RequestData) -> Result<AuthValidationResul
                         );
                         return Err(AuthError::Unauthorized("Unauthorized Access".to_string()));
                     }
+
+                    // Every RUM route is an ingest, and the rum_token is a
+                    // separate credential that never passes through
+                    // `validate_credentials` — so the read-only check has to be
+                    // repeated here rather than inherited.
+                    if read_only_denied(&user, &req_data.method, req_data.uri.path()) {
+                        log::warn!(
+                            "Read only account attempted RUM ingest access: {}",
+                            user.email
+                        );
+                        return Err(AuthError::Forbidden(READ_ONLY_DENIED.to_string()));
+                    }
+
                     Ok(AuthValidationResult {
                         user_email: user.email,
                         user_role: Some(user.role),
@@ -1270,6 +1325,76 @@ mod tests {
         infra::config::{ORG_USERS, USERS},
         meta::user::UserRequest,
     };
+
+    #[cfg(not(feature = "enterprise"))]
+    fn user_with_role(role: UserRole) -> User {
+        User {
+            email: "viewer@example.com".to_string(),
+            first_name: "Read".to_string(),
+            last_name: "Only".to_string(),
+            password: "hash".to_string(),
+            salt: "salt".to_string(),
+            token: "tok".to_string(),
+            rum_token: None,
+            role,
+            org: "default".to_string(),
+            is_external: false,
+            password_ext: None,
+        }
+    }
+
+    /// The OSS gate: a read-only account may read and run searches, may
+    /// maintain its own account, and may do nothing else — ingestion included.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn read_only_accounts_may_only_read() {
+        let viewer = user_with_role(UserRole::Viewer);
+
+        assert!(!read_only_denied(
+            &viewer,
+            &Method::GET,
+            "default/dashboards"
+        ));
+        assert!(!read_only_denied(&viewer, &Method::POST, "default/_search"));
+        assert!(!read_only_denied(
+            &viewer,
+            &Method::PUT,
+            "default/users/viewer@example.com"
+        ));
+
+        assert!(read_only_denied(
+            &viewer,
+            &Method::POST,
+            "default/dashboards"
+        ));
+        assert!(read_only_denied(&viewer, &Method::POST, "default/_bulk"));
+        assert!(read_only_denied(
+            &viewer,
+            &Method::PUT,
+            "default/users/someone.else@example.com"
+        ));
+    }
+
+    /// Roles that are not read-only are never touched by the gate, whatever the
+    /// request looks like.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn writable_roles_are_never_denied_by_the_read_only_gate() {
+        for role in [
+            UserRole::Root,
+            UserRole::Admin,
+            UserRole::Editor,
+            UserRole::ServiceAccount,
+        ] {
+            let user = user_with_role(role);
+            assert!(!read_only_denied(
+                &user,
+                &Method::POST,
+                "default/dashboards"
+            ));
+            assert!(!read_only_denied(&user, &Method::POST, "default/_bulk"));
+        }
+    }
 
     #[test]
     fn extract_rum_token_prefers_query_over_header() {

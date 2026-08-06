@@ -163,9 +163,12 @@ pub fn get_role(role: &UserOrgRole) -> UserRole {
     UserRole::from_str(&role).unwrap()
 }
 
+/// Resolve the effective base role for an OSS deployment: the read-only
+/// `Viewer` is honoured, everything else collapses to `Admin`. See
+/// [`common::meta::user::get_supported_role`] for why.
 #[cfg(not(feature = "enterprise"))]
-pub fn get_role(_role: &UserOrgRole) -> UserRole {
-    UserRole::Admin
+pub fn get_role(role: &UserOrgRole) -> UserRole {
+    common::meta::user::get_supported_role(&role.base_role)
 }
 
 fn deserialize_trimmed<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -968,13 +971,27 @@ mod tests {
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn test_get_role_non_enterprise() {
+        // Roles OSS cannot enforce collapse to Admin — including Root, so this
+        // path can never be used to elevate a user.
+        for role in [
+            UserRole::User,
+            UserRole::Editor,
+            UserRole::Root,
+            UserRole::ServiceAccount,
+        ] {
+            let user_role = UserOrgRole {
+                base_role: role,
+                custom_role: None,
+            };
+            assert_eq!(get_role(&user_role), UserRole::Admin);
+        }
+
+        // The read-only Viewer is the one non-admin role OSS honours.
         let user_role = UserOrgRole {
-            base_role: UserRole::User,
+            base_role: UserRole::Viewer,
             custom_role: None,
         };
-
-        // In non-enterprise mode, should always return Admin
-        assert_eq!(get_role(&user_role), UserRole::Admin);
+        assert_eq!(get_role(&user_role), UserRole::Viewer);
     }
 
     #[cfg(not(feature = "enterprise"))]

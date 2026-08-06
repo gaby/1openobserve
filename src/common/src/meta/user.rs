@@ -174,9 +174,41 @@ pub fn get_roles() -> Vec<UserRole> {
     UserRole::iter().collect()
 }
 
+/// Roles an OSS deployment understands.
+///
+/// OSS has no OpenFGA, so the fine-grained roles (`Editor`, `User`, custom
+/// roles) are not offered — there is nothing to enforce them with. `Viewer` is
+/// the exception: it is a whole-org "read only" account, which the auth layer
+/// enforces on its own via the read-only route policy, so it is available in
+/// OSS as well.
 #[cfg(not(feature = "enterprise"))]
 pub fn get_roles() -> Vec<UserRole> {
-    vec![UserRole::Admin, UserRole::Root, UserRole::ServiceAccount]
+    vec![
+        UserRole::Admin,
+        UserRole::Root,
+        UserRole::ServiceAccount,
+        UserRole::Viewer,
+    ]
+}
+
+/// Collapse a *requested* role to what an OSS deployment can actually enforce.
+///
+/// This is the single rule behind every OSS role assignment. `Viewer` is
+/// honoured — the auth layer enforces it by itself through the read-only route
+/// policy — and everything else collapses to `Admin`, which is the
+/// long-standing OSS behaviour for roles it has no enforcement for.
+///
+/// Note what this deliberately does *not* do: it never elevates. A request
+/// asking for `Root` gets `Admin`, so the user-management endpoints cannot be
+/// used to mint a privileged account. Service accounts are unaffected because
+/// they are created through their own endpoint, which sets the role directly.
+#[cfg(not(feature = "enterprise"))]
+pub fn get_supported_role(requested: &UserRole) -> UserRole {
+    if requested == &UserRole::Viewer {
+        UserRole::Viewer
+    } else {
+        UserRole::Admin
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -480,6 +512,58 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    /// The read-only Viewer is assignable in OSS; the fine-grained roles, which
+    /// OSS has no enforcement for, are not offered.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_oss_roles_include_viewer() {
+        let roles = get_roles();
+        assert!(roles.contains(&UserRole::Viewer));
+        assert!(roles.contains(&UserRole::Admin));
+        assert!(!roles.contains(&UserRole::Editor));
+        assert!(!roles.contains(&UserRole::User));
+    }
+
+    /// A role request resolves to Viewer or Admin and nothing else — in
+    /// particular a request for Root must not elevate.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_get_supported_role() {
+        assert_eq!(get_supported_role(&UserRole::Viewer), UserRole::Viewer);
+        for role in [
+            UserRole::Admin,
+            UserRole::Editor,
+            UserRole::User,
+            UserRole::Root,
+            UserRole::ServiceAccount,
+            UserRole::SreAgent,
+        ] {
+            assert_eq!(get_supported_role(&role), UserRole::Admin);
+        }
+    }
+
+    /// The role a client asks for on the wire ("viewer") has to survive the
+    /// string round-trip into `UserOrgRole`, which is what the user-management
+    /// endpoints actually parse.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_viewer_role_request_parses_in_oss() {
+        let parsed = UserOrgRole::from(&UserRoleRequest {
+            role: "viewer".to_string(),
+            custom: None,
+        });
+        assert_eq!(parsed.base_role, UserRole::Viewer);
+        assert!(parsed.custom_role.is_none());
+
+        // A role OSS cannot enforce falls back to the default (Admin) and is
+        // carried along as a custom role, which OSS then rejects outright.
+        let parsed = UserOrgRole::from(&UserRoleRequest {
+            role: "editor".to_string(),
+            custom: None,
+        });
+        assert_eq!(parsed.base_role, UserRole::Admin);
+    }
 
     #[test]
     fn test_user_request() {

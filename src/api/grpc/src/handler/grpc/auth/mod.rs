@@ -108,6 +108,17 @@ fn check_auth_inner(
             return Err(Status::unauthenticated("No valid auth token[4]"));
         };
 
+        // `allow_org_ingestion_token` marks the OTLP logs/metrics/traces
+        // services — i.e. this request is an ingest. A read-only account has no
+        // write path over HTTP, so it must not gain one over gRPC either.
+        // Enterprise builds also run their own RBAC on top of this.
+        if allow_org_ingestion_token && user.role.is_read_only() {
+            log::warn!("Read only account attempted OTLP gRPC ingestion: {user_id}");
+            return Err(Status::permission_denied(
+                "Read only account: this operation is not permitted",
+            ));
+        }
+
         if user.token.eq(&credentials.password) {
             let mut req = req;
             let user_id_metadata = MetadataValue::try_from(&user_id).unwrap();

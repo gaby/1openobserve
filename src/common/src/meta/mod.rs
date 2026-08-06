@@ -22,6 +22,7 @@ pub mod maxmind;
 pub mod middleware_data;
 pub mod organization;
 pub mod proxy;
+pub mod read_only_routes;
 pub mod saved_view;
 pub mod service;
 pub mod service_account;

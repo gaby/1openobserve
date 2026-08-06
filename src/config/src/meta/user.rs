@@ -127,6 +127,17 @@ impl UserRole {
         matches!(self, UserRole::ServiceAccount | UserRole::SreAgent)
     }
 
+    /// Returns true for roles that may only *read*.
+    ///
+    /// `Viewer` is the human "read only" account; `SreAgent` is the
+    /// system-managed equivalent for agent tokens. In enterprise builds the
+    /// OpenFGA model is what actually enforces this; in OSS builds (no FGA) the
+    /// auth layer uses this flag together with the `read_only_routes` policy
+    /// table (in the `common` crate) to reject writes.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, UserRole::Viewer | UserRole::SreAgent)
+    }
+
     pub fn get_label(&self) -> String {
         match self {
             UserRole::Admin => "Admin".to_string(),
@@ -435,6 +446,19 @@ mod tests {
         assert!(!UserRole::Admin.is_service_account());
         assert!(!UserRole::Viewer.is_service_account());
         assert!(!UserRole::Root.is_service_account());
+    }
+
+    #[test]
+    fn test_user_role_is_read_only() {
+        assert!(UserRole::Viewer.is_read_only());
+        assert!(UserRole::SreAgent.is_read_only());
+        assert!(!UserRole::Root.is_read_only());
+        assert!(!UserRole::Admin.is_read_only());
+        assert!(!UserRole::Editor.is_read_only());
+        assert!(!UserRole::ServiceAccount.is_read_only());
+        // `User` is a login-only account with no access at all — it is not a
+        // read-only account, and must not be granted read access by proxy.
+        assert!(!UserRole::User.is_read_only());
     }
 
     #[test]

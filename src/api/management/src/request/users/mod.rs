@@ -45,6 +45,8 @@ use {
     openobserve_core::auth::check_permissions,
 };
 
+#[cfg(not(feature = "enterprise"))]
+use crate::common::meta::user::get_supported_role;
 use crate::{
     common::meta::{
         self,
@@ -197,7 +199,7 @@ pub async fn save(
 
     #[cfg(not(feature = "enterprise"))]
     {
-        user.role.base_role = UserRole::Admin;
+        user.role.base_role = get_supported_role(&user.role.base_role);
     }
     match users::post_user(&org_id, user, &initiator_id).await {
         Ok(resp) => resp,
@@ -289,13 +291,21 @@ pub async fn update(
             .unwrap();
     }
 
+    // Only normalise a role the caller actually asked for. Forcing a role on
+    // every update — as this used to do — would silently promote a read-only
+    // account to Admin the moment anyone edited its name or password.
     #[cfg(not(feature = "enterprise"))]
-    {
+    if let Some(role_request) = user.role.as_ref() {
+        let requested = role_request
+            .role
+            .parse::<UserRole>()
+            .unwrap_or(UserRole::Admin);
         user.role = Some(UserRoleRequest {
-            role: UserRole::Admin.to_string(),
+            role: get_supported_role(&requested).to_string(),
             custom: None,
         });
     }
+
     let initiator_id = &user_email.user_id;
     let update_mode = if user_email.user_id.eq(&email_id) {
         UserUpdateMode::SelfUpdate
@@ -1207,5 +1217,36 @@ mod tests {
         assert!(result.is_some());
         let role_response = result.unwrap();
         assert_eq!(role_response.value, "admin");
+    }
+
+    /// OSS offers exactly two assignable roles: Admin and the read-only Viewer.
+    /// This is what the role dropdown in the UI is built from.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_assignable_roles_in_oss_include_viewer() {
+        let values = get_roles()
+            .iter()
+            .filter_map(check_role_available)
+            .map(|r| r.value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["admin".to_string(), "viewer".to_string()]);
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_get_supported_role() {
+        // Viewer is the one non-admin role OSS can enforce on its own.
+        assert_eq!(get_supported_role(&UserRole::Viewer), UserRole::Viewer);
+        // Everything else collapses to Admin, as it always has in OSS —
+        // including Root, so these endpoints cannot mint a privileged account.
+        for role in [
+            UserRole::Admin,
+            UserRole::Editor,
+            UserRole::User,
+            UserRole::Root,
+            UserRole::ServiceAccount,
+        ] {
+            assert_eq!(get_supported_role(&role), UserRole::Admin);
+        }
     }
 }

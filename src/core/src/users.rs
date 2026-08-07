@@ -264,6 +264,10 @@ pub async fn update_user(
     mut user: UpdateUser,
 ) -> Result<Response, Error> {
     let mut allow_password_update = false;
+    // Whether the initiator may administer `email` — i.e. change a role that is
+    // not their own. Computed alongside `allow_password_update` below, which
+    // covers only passwords and tokens and so left role changes unguarded.
+    let mut allow_role_update = false;
     #[cfg(feature = "cloud")]
     let is_cloud = true;
     #[cfg(not(feature = "cloud"))]
@@ -328,7 +332,8 @@ pub async fn update_user(
                 }
                 if !update_mode.is_self_update() {
                     if is_root_user(initiator_id) {
-                        allow_password_update = true
+                        allow_password_update = true;
+                        allow_role_update = true;
                     } else {
                         let initiating_user = match db::user::get(Some(org_id), initiator_id).await
                         {
@@ -347,7 +352,8 @@ pub async fn update_user(
                                 && (initiating_user.role.eq(&UserRole::Admin)
                                     || initiating_user.role.eq(&UserRole::Root)))
                         {
-                            allow_password_update = true
+                            allow_password_update = true;
+                            allow_role_update = true;
                         }
                     }
                 }
@@ -425,6 +431,17 @@ pub async fn update_user(
                         message = "Root user role cannot be changed";
                     } else if update_mode.is_self_update() && local_user.role < new_user.role {
                         message = "Self role cannot be upgraded";
+                    } else if !update_mode.is_self_update()
+                        && !allow_role_update
+                        && local_user.role.ne(&new_user.role)
+                    {
+                        // Changing somebody else's role is privileged. Without
+                        // this, the only thing standing between an unprivileged
+                        // caller and an arbitrary role change was the
+                        // `is_self_update` branch above — so anything that made
+                        // a self-update look like an update of *another* account
+                        // skipped the check entirely rather than tightening it.
+                        message = "Only Admin or Root can change a user's role";
                     } else {
                         is_org_updated |= local_user.role.ne(&new_user.role);
                         #[cfg(feature = "enterprise")]
@@ -1335,6 +1352,7 @@ pub async fn create_service_account_if_not_exists(email: &str) -> Result<(), any
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use common::{infra::config::USERS, meta::user::get_default_user_role};
     use config::meta::user::{UserRole, UserType};
     use infra::{
@@ -1474,6 +1492,92 @@ mod tests {
                 password_ext: Some("root_password_ext_hash".to_string()),
             },
         );
+    }
+
+    /// A read-only account must not be able to hand itself a role it does not
+    /// have. The `is_self_update` guard alone was not enough: anything that made
+    /// a self-update look like an update of *another* account — a path email
+    /// differing only in letter case, since every lookup below resolves
+    /// case-insensitively — skipped that guard instead of tightening it. The
+    /// role branch now demands an Admin/Root initiator in its own right.
+    #[tokio::test]
+    async fn test_unprivileged_initiator_cannot_change_a_role() {
+        set_up().await;
+
+        post_user(
+            "dummy",
+            UserRequest {
+                email: "viewer@zo.dev".to_string(),
+                password: "pass#123".to_string(),
+                role: common::meta::user::UserOrgRole {
+                    base_role: UserRole::Viewer,
+                    custom_role: None,
+                },
+                first_name: "viewer".to_owned(),
+                last_name: "".to_owned(),
+                is_external: false,
+                token: None,
+            },
+            "admin@zo.dev",
+        )
+        .await
+        .expect("failed to create the viewer");
+
+        let promote_to_admin = || UpdateUser {
+            role: Some(common::meta::user::UserRoleRequest {
+                role: UserRole::Admin.to_string(),
+                custom: None,
+            }),
+            token: None,
+            first_name: None,
+            last_name: None,
+            old_password: None,
+            new_password: None,
+            change_password: false,
+        };
+
+        // Read the stored role, not `get_user` — that reads the ORG_USERS cache,
+        // which only the coordinator watcher refreshes and which therefore never
+        // moves in a unit test. Asserting the cache would pass whether or not
+        // the write was actually refused.
+        let stored_role = async || {
+            db::org_users::get_from_db("dummy", "viewer@zo.dev")
+                .await
+                .unwrap()
+                .role
+        };
+
+        // The escalation path: a Viewer naming itself, but in a spelling that
+        // does not compare equal to its canonical email, so the caller is
+        // treated as updating somebody else.
+        let resp = update_user(
+            "dummy",
+            "viewer@zo.dev",
+            UserUpdateMode::OtherUpdate,
+            "viewer@zo.dev",
+            promote_to_admin(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            stored_role().await,
+            UserRole::Viewer,
+            "role must be unchanged after a refused escalation"
+        );
+
+        // The same request from an Admin is legitimate and still works.
+        let resp = update_user(
+            "dummy",
+            "viewer@zo.dev",
+            UserUpdateMode::OtherUpdate,
+            "admin@zo.dev",
+            promote_to_admin(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stored_role().await, UserRole::Admin);
     }
 
     #[tokio::test]

@@ -235,12 +235,35 @@ pub async fn save(
         ("x-o2-mcp" = json!({"description": "Update user details", "category": "users"}))
     )
 )]
+/// Is `target` the caller's own account?
+///
+/// Both sides must already be canonical (lowercased). This is the *only* thing
+/// standing between a caller and the privileged `OtherUpdate` path in
+/// [`openobserve_core::users::update_user`], so it has to agree with how every
+/// layer below identifies a user — and those are all case-insensitive
+/// (`get_cached_user_org` lowercases its key, the org_users queries filter on
+/// `LOWER(email)`). A target that differs only in case must therefore be a
+/// self-update, not an update of somebody else.
+fn update_mode_for(caller: &str, target: &str) -> UserUpdateMode {
+    if caller.eq(target) {
+        UserUpdateMode::SelfUpdate
+    } else {
+        UserUpdateMode::OtherUpdate
+    }
+}
+
 pub async fn update(
     Path((org_id, email_id)): Path<(String, String)>,
     Headers(user_email): Headers<UserEmail>,
     axum::Json(user): axum::Json<UpdateUser>,
 ) -> Response {
-    let email_id = email_id.trim().to_string();
+    // Lowercased, like the create path above and like every storage lookup
+    // (`get_cached_user_org` lowercases its cache key; the org_users queries
+    // filter on `LOWER(email)`). Without this, an email differing only in case
+    // resolves to the caller's own record everywhere downstream while the
+    // `update_mode` comparison below still reads it as somebody *else*, which
+    // is what turns a self-update into a role change nobody is allowed to make.
+    let email_id = email_id.trim().to_lowercase();
     #[cfg(not(feature = "enterprise"))]
     let mut user = user;
     if user.eq(&UpdateUser::default()) {
@@ -305,11 +328,7 @@ pub async fn update(
     }
 
     let initiator_id = &user_email.user_id;
-    let update_mode = if user_email.user_id.eq(&email_id) {
-        UserUpdateMode::SelfUpdate
-    } else {
-        UserUpdateMode::OtherUpdate
-    };
+    let update_mode = update_mode_for(&user_email.user_id, &email_id);
     match users::update_user(&org_id, &email_id, update_mode, initiator_id, user).await {
         Ok(resp) => resp,
         Err(e) => MetaHttpResponse::internal_error(e),
@@ -1215,6 +1234,32 @@ mod tests {
         assert!(result.is_some());
         let role_response = result.unwrap();
         assert_eq!(role_response.value, "admin");
+    }
+
+    /// A path email differing from the caller's only in case must still be a
+    /// self-update. Read it as `OtherUpdate` and the caller lands on the
+    /// privileged branch of `update_user`, which skips the "Self role cannot be
+    /// upgraded" guard — that is a read-only account handing itself Admin.
+    /// The handler lowercases the path segment before this runs, so the two
+    /// spellings converge here.
+    #[test]
+    fn test_case_varied_self_email_is_a_self_update() {
+        let caller = "viewer@example.com";
+        for target in [
+            "Viewer@example.com",
+            "VIEWER@EXAMPLE.COM",
+            "  viewer@example.com  ",
+        ] {
+            assert_eq!(
+                update_mode_for(caller, &target.trim().to_lowercase()),
+                UserUpdateMode::SelfUpdate,
+                "{target} names the caller's own account"
+            );
+        }
+        assert_eq!(
+            update_mode_for(caller, "someone.else@example.com"),
+            UserUpdateMode::OtherUpdate
+        );
     }
 
     /// OSS offers exactly two assignable roles: Admin and the read-only Viewer.

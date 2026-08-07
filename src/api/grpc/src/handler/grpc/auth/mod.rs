@@ -49,6 +49,10 @@ fn check_auth_inner(
     allow_org_ingestion_token: bool,
     is_write: bool,
 ) -> Result<Request<()>, Status> {
+    // Only the OSS read-only gate consults this; enterprise defers to OpenFGA.
+    #[cfg(feature = "enterprise")]
+    let _ = is_write;
+
     let cfg = config::get_config();
     let metadata = req.metadata();
     if !metadata.contains_key(&cfg.grpc.org_header_key) && !metadata.contains_key("authorization") {
@@ -119,6 +123,20 @@ fn check_auth_inner(
             return Err(Status::unauthenticated("No valid auth token[4]"));
         };
 
+        // Authenticate first. The read-only check below is an *authorization*
+        // decision and must not run against an unverified caller: doing so
+        // answers `permission_denied` rather than `unauthenticated` to anyone
+        // who merely guesses a read-only account's email, confirming both that
+        // the account exists and that it is read only.
+        let authenticated = user.token.eq(&credentials.password) || {
+            let in_pass = get_hash(&credentials.password, &user.salt);
+            user_id.eq(&user.email)
+                && (credentials.password.eq(&user.password) || in_pass.eq(&user.password))
+        };
+        if !authenticated {
+            return Err(Status::unauthenticated("No valid auth token[5]"));
+        }
+
         // A read-only account has no write path over HTTP, so it must not gain
         // one over gRPC either. Keyed on the service's declared `is_write`
         // rather than on `allow_org_ingestion_token`, which only marks the OTLP
@@ -132,30 +150,16 @@ fn check_auth_inner(
             ));
         }
 
-        if user.token.eq(&credentials.password) {
-            let mut req = req;
-            let user_id_metadata = MetadataValue::try_from(&user_id).unwrap();
-            req.metadata_mut().append("user_id", user_id_metadata);
-            return Ok(req);
-        }
-        let in_pass = get_hash(&credentials.password, &user.salt);
-        if user_id.eq(&user.email)
-            && (credentials.password.eq(&user.password) || in_pass.eq(&user.password))
-        {
-            let mut req = req;
-            let user_id_metadata = MetadataValue::try_from(&user_id).unwrap();
-            req.metadata_mut().append("user_id", user_id_metadata);
-
-            Ok(req)
-        } else {
-            Err(Status::unauthenticated("No valid auth token[5]"))
-        }
+        let mut req = req;
+        let user_id_metadata = MetadataValue::try_from(&user_id).unwrap();
+        req.metadata_mut().append("user_id", user_id_metadata);
+        Ok(req)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use common::infra::config::{ORG_INGESTION_TOKENS, ORG_USERS};
+    use common::infra::config::{ORG_INGESTION_TOKENS, ORG_USERS, USERS};
     use config::{
         cache_instance_id, get_config,
         meta::user::{User, UserRole},
@@ -163,6 +167,71 @@ mod tests {
     use infra::table::org_users::OrgUserRecord;
 
     use super::*;
+
+    /// Registers a read-only Viewer in `default` and returns a request bearing
+    /// `authorization`/`organization` metadata for the given Basic credential.
+    #[cfg(not(feature = "enterprise"))]
+    fn viewer_request(basic: &str) -> tonic::Request<()> {
+        cache_instance_id("instance");
+        USERS.insert(
+            "viewer@example.com".to_string(),
+            infra::table::users::UserRecord {
+                email: "viewer@example.com".to_string(),
+                first_name: "Read".to_string(),
+                last_name: "Only".to_string(),
+                password: "Complexpass#123".to_string(),
+                salt: "Complexpass#123".to_string(),
+                is_root: false,
+                password_ext: Some("Complexpass#123".to_string()),
+                user_type: config::meta::user::UserType::Internal,
+                created_at: 0,
+                updated_at: 0,
+            },
+        );
+        ORG_USERS.insert(
+            "default/viewer@example.com".to_string(),
+            OrgUserRecord {
+                role: UserRole::Viewer,
+                token: "viewer-token".to_string(),
+                rum_token: None,
+                org_id: "default".to_string(),
+                email: "viewer@example.com".to_string(),
+                created_at: 0,
+                allow_static_token: true,
+            },
+        );
+
+        let mut request = tonic::Request::new(());
+        let meta = request.metadata_mut();
+        meta.insert("authorization", basic.parse().unwrap());
+        meta.insert("organization", "default".parse().unwrap());
+        request
+    }
+
+    /// A read-only account is refused on a write service but still reaches the
+    /// read services, which is the whole point of the role.
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn test_read_only_account_denied_on_write_service() {
+        let basic = "basic dmlld2VyQGV4YW1wbGUuY29tOkNvbXBsZXhwYXNzIzEyMw==";
+
+        let err = check_write_auth(viewer_request(basic)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(check_otlp_auth(viewer_request(basic)).is_err());
+        assert!(check_auth(viewer_request(basic)).is_ok());
+    }
+
+    /// Authorization must not be decided before authentication: a wrong password
+    /// on a write service has to read as `unauthenticated`, never
+    /// `permission_denied` — the latter would confirm to an unauthenticated
+    /// caller that the account exists and is read only.
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn test_bad_password_is_unauthenticated_not_permission_denied() {
+        let request = viewer_request("basic dmlld2VyQGV4YW1wbGUuY29tOldyb25nUGFzcyMxMjM=");
+        let err = check_write_auth(request).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
 
     #[tokio::test]
     async fn test_check_no_auth() {

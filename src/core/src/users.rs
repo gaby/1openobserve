@@ -264,9 +264,8 @@ pub async fn update_user(
     mut user: UpdateUser,
 ) -> Result<Response, Error> {
     let mut allow_password_update = false;
-    // Whether the initiator may administer `email` — i.e. change a role that is
-    // not their own. Computed alongside `allow_password_update` below, which
-    // covers only passwords and tokens and so left role changes unguarded.
+    // May the initiator change a role that is not their own? The neighbouring
+    // `allow_password_update` covers only passwords and tokens.
     let mut allow_role_update = false;
     #[cfg(feature = "cloud")]
     let is_cloud = true;
@@ -435,12 +434,9 @@ pub async fn update_user(
                         && !allow_role_update
                         && local_user.role.ne(&new_user.role)
                     {
-                        // Changing somebody else's role is privileged. Without
-                        // this, the only thing standing between an unprivileged
-                        // caller and an arbitrary role change was the
-                        // `is_self_update` branch above — so anything that made
-                        // a self-update look like an update of *another* account
-                        // skipped the check entirely rather than tightening it.
+                        // Without this, anything that made a self-update look
+                        // like an update of another account skipped the
+                        // `is_self_update` guard instead of tightening it.
                         message = "Only Admin or Root can change a user's role";
                     } else {
                         is_org_updated |= local_user.role.ne(&new_user.role);
@@ -1494,12 +1490,9 @@ mod tests {
         );
     }
 
-    /// A read-only account must not be able to hand itself a role it does not
-    /// have. The `is_self_update` guard alone was not enough: anything that made
-    /// a self-update look like an update of *another* account — a path email
-    /// differing only in letter case, since every lookup below resolves
-    /// case-insensitively — skipped that guard instead of tightening it. The
-    /// role branch now demands an Admin/Root initiator in its own right.
+    /// A read-only account must not hand itself a role. The `is_self_update`
+    /// guard alone was not enough, so the role branch now demands an Admin/Root
+    /// initiator in its own right.
     #[tokio::test]
     async fn test_unprivileged_initiator_cannot_change_a_role() {
         set_up().await;
@@ -1537,9 +1530,7 @@ mod tests {
         };
 
         // Read the stored role, not `get_user` — that reads the ORG_USERS cache,
-        // which only the coordinator watcher refreshes and which therefore never
-        // moves in a unit test. Asserting the cache would pass whether or not
-        // the write was actually refused.
+        // which no watcher refreshes under test, so it would pass either way.
         let stored_role = async || {
             db::org_users::get_from_db("dummy", "viewer@zo.dev")
                 .await
@@ -1547,9 +1538,8 @@ mod tests {
                 .role
         };
 
-        // The escalation path: a Viewer naming itself, but in a spelling that
-        // does not compare equal to its canonical email, so the caller is
-        // treated as updating somebody else.
+        // A Viewer naming itself in a spelling that does not compare equal to
+        // its canonical email, so it reads as updating somebody else.
         let resp = update_user(
             "dummy",
             "viewer@zo.dev",
@@ -1566,7 +1556,7 @@ mod tests {
             "role must be unchanged after a refused escalation"
         );
 
-        // The same request from an Admin is legitimate and still works.
+        // The same request from an Admin still works.
         let resp = update_user(
             "dummy",
             "viewer@zo.dev",

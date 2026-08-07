@@ -13,47 +13,31 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Positional route matching, shared by the declarative route tables in this
-//! module ([`super::ingestion_routes`] and [`super::read_only_routes`]).
+//! Positional route matching, shared by [`super::ingestion_routes`] and
+//! [`super::read_only_routes`] so their normalisation rules cannot drift.
 //!
-//! Both tables answer an authorization question by matching a request against
-//! declared `(path shape, methods)` rows, and both must normalise the request
-//! path the same way to be sound. Historically the auth layer matched paths by
-//! substring — which is what let an ingestion token read protected data on
-//! `GET /{org}/{stream}/traces/latest`, GHSA-wffq-g8qf-ccmv. Matching here is
-//! *positional* instead: a stream literally named `traces` only ever lands in a
-//! [`Seg::Param`] slot and can never be mistaken for the `traces` keyword.
-//!
-//! Keeping the matcher in one place is deliberate: two copies of these
-//! normalisation rules would drift, and a fix applied to one table would
-//! silently miss the other.
+//! Positional rather than substring matching: substring matching is what let an
+//! ingestion token read `GET /{org}/{stream}/traces/latest` (GHSA-wffq-g8qf-ccmv).
+//! A stream named `traces` only ever lands in a [`Seg::Param`] slot.
 
 /// One segment of a declared route pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Seg {
     /// A fixed path segment that must match exactly (e.g. `_bulk`, `traces`).
     Lit(&'static str),
-    /// A single path parameter — matches any one non-empty segment
-    /// (`{org_id}`, `{stream_name}`, `{name}`, ...). It deliberately does NOT
-    /// match a keyword by accident because matching is positional.
+    /// Any one non-empty segment (`{org_id}`, `{stream_name}`, ...).
     Param,
-    /// A single path parameter constrained to the caller-supplied *subject*
-    /// (see `subject_matches` on [`segments_match`]) — e.g. "this must be the
-    /// caller's own account". A table that supplies no subject predicate can
-    /// never match this pattern, so it fails closed.
+    /// A segment constrained to the caller-supplied subject (see
+    /// `subject_matches` on [`segments_match`]). Fails closed without one.
     Subject,
 }
 
-/// The `/v2/...` API prefix, stripped before matching so `/v2/{org}/_bulk`
-/// classifies identically to `/{org}/_bulk`.
+/// Stripped before matching, so `/v2/{org}/_bulk` matches `/{org}/_bulk`.
 const V2_API_PREFIX: &str = "v2";
 
-/// Strip the leading `/` and an optional `/v2/` prefix, leaving a path that
-/// starts at `{org_id}`.
-///
-/// Returned as a `&str` rather than pre-split segments so callers that need to
-/// distinguish a trailing slash (e.g. the Elasticsearch root ping `GET /{org}/`)
-/// can still see it.
+/// Strip the leading `/` and any `/v2/` prefix, leaving a path at `{org_id}`.
+/// Returns a `&str` so callers can still see a trailing slash (e.g. the
+/// Elasticsearch root ping `GET /{org}/`).
 pub(crate) fn strip_api_prefixes(path: &str) -> &str {
     let path = path.strip_prefix('/').unwrap_or(path);
     path.strip_prefix(V2_API_PREFIX)
@@ -61,18 +45,13 @@ pub(crate) fn strip_api_prefixes(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// Split a prefix-stripped path into the segments used for matching.
-///
-/// A single trailing empty segment (trailing slash) is dropped, so
-/// `.../_bulk/` matches the same row as `.../_bulk`.
+/// Split a prefix-stripped path for matching, dropping one trailing slash.
 pub(crate) fn columns(path: &str) -> Vec<&str> {
     path.strip_suffix('/').unwrap_or(path).split('/').collect()
 }
 
-/// Does this segment pattern list match these path segments?
-///
 /// `subject_matches` decides [`Seg::Subject`] segments; pass `|_| false` from
-/// tables that declare no subject-constrained routes.
+/// tables with no subject-constrained routes.
 pub(crate) fn segments_match(
     patterns: &[Seg],
     columns: &[&str],
@@ -83,7 +62,6 @@ pub(crate) fn segments_match(
     }
     patterns.iter().zip(columns).all(|(pat, col)| match pat {
         Seg::Lit(lit) => col == lit,
-        // A param matches any single non-empty segment.
         Seg::Param => !col.is_empty(),
         Seg::Subject => subject_matches(col),
     })
@@ -98,8 +76,7 @@ mod tests {
         assert_eq!(strip_api_prefixes("default/_bulk"), "default/_bulk");
         assert_eq!(strip_api_prefixes("/default/_bulk"), "default/_bulk");
         assert_eq!(strip_api_prefixes("/v2/default/_bulk"), "default/_bulk");
-        // `v2` as an org name is not a prefix — it has no following slash to
-        // strip beyond its own, so the org survives.
+        // `v2` as an org name is not a prefix.
         assert_eq!(strip_api_prefixes("/v2suffix/_bulk"), "v2suffix/_bulk");
     }
 
@@ -119,14 +96,12 @@ mod tests {
             &["default", "traces", "latest"],
             |_| false
         ));
-        // A stream *named* `traces` cannot impersonate the keyword slot.
         assert!(!segments_match(pattern, &["default", "traces"], |_| false));
         assert!(!segments_match(
             pattern,
             &["default", "traces", "latest", "extra"],
             |_| false
         ));
-        // A param never matches an empty segment.
         assert!(!segments_match(&[Param], &[""], |_| false));
     }
 

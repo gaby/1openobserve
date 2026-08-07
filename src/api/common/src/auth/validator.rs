@@ -120,20 +120,9 @@ pub struct AuthValidationResult {
     pub is_internal_user: bool,
 }
 
-/// Refuse this request if the authenticated account is read only and the route
-/// is not one it may reach.
-///
-/// Enterprise builds answer this with the OpenFGA model — every route carries a
-/// declared permission — so the check is a no-op there. OSS builds have no
-/// authorization model behind the roles, so a `Viewer` (or the system-managed
-/// `SreAgent`) is held to the read-only route policy instead: safe methods, the
-/// declared query-by-POST routes, and self-service maintenance of its own
-/// account. Everything else, ingestion included, is refused.
-///
-/// Applied to every authenticated request — password, session and static-token
-/// alike — rather than in the permission layer, because in OSS the
-/// `AuthExtractor` marks every request `bypass_check`, so the permission layer
-/// never runs.
+/// Refuse this request if the account is read only and the route is not one it
+/// may reach. OSS only: enterprise answers this with OpenFGA. Applied here
+/// rather than in the permission layer, which OSS skips via `bypass_check`.
 #[cfg(not(feature = "enterprise"))]
 fn check_read_only(
     role: &UserRole,
@@ -292,12 +281,8 @@ pub async fn validate_credentials(
     let resp =
         validate_credentials_inner(user_id, user_password, path, method, from_session).await?;
 
-    // One gate covering every credential branch below. `validate_credentials_inner`
-    // has several successful exits — service-account token, user ingestion token,
-    // password — and is under active security churn; checking the resolved
-    // response instead of each exit means a branch added later cannot silently
-    // hand a read-only account a write path. Responses that failed to
-    // authenticate carry no role and are left alone.
+    // Gate the resolved response, not each of the inner fn's several success
+    // exits, so a branch added later cannot slip past this.
     if let Some(role) = resp.user_role.as_ref() {
         check_read_only(role, &resp.user_email, method, path)?;
     }
@@ -645,8 +630,7 @@ async fn validate_credentials_inner(
         }
     }
     let in_pass = get_hash(user_password, &user.salt);
-    // `as_deref` rather than `unwrap()`: `user` is still needed below for the
-    // read-only check and the response, so the password must not be moved out.
+    // `as_deref`, not `unwrap()`: `user` is still needed below.
     if !user.password.eq(&in_pass) && user.password_ext.as_deref().unwrap_or("") != user_password {
         return Ok(TokenValidationResponse {
             is_valid: false,
@@ -1129,12 +1113,8 @@ pub async fn validator_rum(req_data: &RequestData) -> Result<AuthValidationResul
                         return Err(AuthError::Unauthorized("Unauthorized Access".to_string()));
                     }
 
-                    // The rum_token is a separate credential that never passes
-                    // through `validate_credentials`, so the read-only check has
-                    // to be repeated here rather than inherited. Every RUM route
-                    // is an ingest, so the role alone decides — consulting the
-                    // route table would be misleading, as no RUM path can ever
-                    // appear in it.
+                    // rum_token bypasses `validate_credentials`, so repeat the
+                    // check here. Every RUM route is an ingest, so role decides.
                     #[cfg(not(feature = "enterprise"))]
                     if user.role.is_read_only() {
                         log::warn!(
@@ -1367,10 +1347,8 @@ mod tests {
         }
     }
 
-    /// The OSS gate refuses a read-only account a write and allows it a read.
-    /// The route table itself is exercised in `common::meta::read_only_routes`;
-    /// what this asserts is the role conjunction and that the caller's own
-    /// email reaches the self-service rows.
+    /// The table itself is tested in `common::meta::read_only_routes`; this
+    /// covers the role conjunction and the self-service rows.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn read_only_accounts_may_only_read() {
@@ -1387,8 +1365,7 @@ mod tests {
         ));
     }
 
-    /// Roles that are not read-only are never touched by the gate, whatever the
-    /// request looks like.
+    /// Writable roles are never touched by the gate.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn writable_roles_are_never_denied_by_the_read_only_gate() {

@@ -253,9 +253,7 @@ fn authenticated<S>(service: S) -> InterceptedService<S, AuthInterceptor> {
     InterceptedService::new(service, check_auth)
 }
 
-/// For services that write data on the internal cluster credentials — a
-/// read-only account is refused, unlike the read services wrapped by
-/// [`authenticated`].
+/// Like [`authenticated`], but refuses read-only accounts.
 fn write_authenticated<S>(service: S) -> InterceptedService<S, AuthInterceptor> {
     InterceptedService::new(service, check_write_auth)
 }

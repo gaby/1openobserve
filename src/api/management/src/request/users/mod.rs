@@ -235,15 +235,8 @@ pub async fn save(
         ("x-o2-mcp" = json!({"description": "Update user details", "category": "users"}))
     )
 )]
-/// Is `target` the caller's own account?
-///
-/// Both sides must already be canonical (lowercased). This is the *only* thing
-/// standing between a caller and the privileged `OtherUpdate` path in
-/// [`openobserve_core::users::update_user`], so it has to agree with how every
-/// layer below identifies a user — and those are all case-insensitive
-/// (`get_cached_user_org` lowercases its key, the org_users queries filter on
-/// `LOWER(email)`). A target that differs only in case must therefore be a
-/// self-update, not an update of somebody else.
+/// Is `target` the caller's own account? Both sides must already be lowercased,
+/// since every user lookup below this is case-insensitive.
 fn update_mode_for(caller: &str, target: &str) -> UserUpdateMode {
     if caller.eq(target) {
         UserUpdateMode::SelfUpdate
@@ -257,12 +250,8 @@ pub async fn update(
     Headers(user_email): Headers<UserEmail>,
     axum::Json(user): axum::Json<UpdateUser>,
 ) -> Response {
-    // Lowercased, like the create path above and like every storage lookup
-    // (`get_cached_user_org` lowercases its cache key; the org_users queries
-    // filter on `LOWER(email)`). Without this, an email differing only in case
-    // resolves to the caller's own record everywhere downstream while the
-    // `update_mode` comparison below still reads it as somebody *else*, which
-    // is what turns a self-update into a role change nobody is allowed to make.
+    // Lowercased like the create path, so a differently-cased spelling of the
+    // caller's own email cannot read as an update of somebody else.
     let email_id = email_id.trim().to_lowercase();
     #[cfg(not(feature = "enterprise"))]
     let mut user = user;
@@ -314,14 +303,10 @@ pub async fn update(
             .unwrap();
     }
 
-    // Only normalise a role the caller actually asked for. Forcing a role on
-    // every update — as this used to do — would silently promote a read-only
-    // account to Admin the moment anyone edited its name or password.
+    // Only normalise a role the caller actually asked for; forcing one on every
+    // update would promote a Viewer to Admin on any profile edit.
     #[cfg(not(feature = "enterprise"))]
     if let Some(role_request) = user.role.as_mut() {
-        // Resolved through `UserOrgRole::from`, the same conversion the create
-        // path and `core::users` use, so a role spelled "Viewer" resolves the
-        // same way here as it does there.
         let requested = UserOrgRole::from(&*role_request).base_role;
         role_request.role = get_supported_role(&requested).to_string();
         role_request.custom = None;
@@ -1236,12 +1221,8 @@ mod tests {
         assert_eq!(role_response.value, "admin");
     }
 
-    /// A path email differing from the caller's only in case must still be a
-    /// self-update. Read it as `OtherUpdate` and the caller lands on the
-    /// privileged branch of `update_user`, which skips the "Self role cannot be
-    /// upgraded" guard — that is a read-only account handing itself Admin.
-    /// The handler lowercases the path segment before this runs, so the two
-    /// spellings converge here.
+    /// A path email differing only in case is still a self-update; reading it as
+    /// `OtherUpdate` skips the "Self role cannot be upgraded" guard.
     #[test]
     fn test_case_varied_self_email_is_a_self_update() {
         let caller = "viewer@example.com";
@@ -1262,8 +1243,7 @@ mod tests {
         );
     }
 
-    /// OSS offers exactly two assignable roles: Admin and the read-only Viewer.
-    /// This is what the role dropdown in the UI is built from.
+    /// OSS offers exactly two assignable roles; the UI dropdown is built from this.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn test_assignable_roles_in_oss_include_viewer() {

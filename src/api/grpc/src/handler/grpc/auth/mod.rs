@@ -25,12 +25,8 @@ pub fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     check_auth_inner(req, false, false)
 }
 
-/// Authenticate a gRPC service that writes data, on the internal cluster
-/// credential set.
-///
-/// Same as [`check_auth`], but marked as a write so a read-only account cannot
-/// reach it. Kept separate from [`check_otlp_auth`] because these services do
-/// *not* accept org ingestion tokens.
+/// Like [`check_auth`] but marked as a write, so read-only accounts are refused.
+/// Separate from [`check_otlp_auth`]: these services take no org ingestion token.
 pub fn check_write_auth(req: Request<()>) -> Result<Request<()>, Status> {
     check_auth_inner(req, false, true)
 }
@@ -49,7 +45,6 @@ fn check_auth_inner(
     allow_org_ingestion_token: bool,
     is_write: bool,
 ) -> Result<Request<()>, Status> {
-    // Only the OSS read-only gate consults this; enterprise defers to OpenFGA.
     #[cfg(feature = "enterprise")]
     let _ = is_write;
 
@@ -123,11 +118,8 @@ fn check_auth_inner(
             return Err(Status::unauthenticated("No valid auth token[4]"));
         };
 
-        // Authenticate first. The read-only check below is an *authorization*
-        // decision and must not run against an unverified caller: doing so
-        // answers `permission_denied` rather than `unauthenticated` to anyone
-        // who merely guesses a read-only account's email, confirming both that
-        // the account exists and that it is read only.
+        // Authenticate before the authorization check below, so an unverified
+        // caller gets `unauthenticated` rather than `permission_denied`.
         let authenticated = user.token.eq(&credentials.password) || {
             let in_pass = get_hash(&credentials.password, &user.salt);
             user_id.eq(&user.email)
@@ -137,11 +129,8 @@ fn check_auth_inner(
             return Err(Status::unauthenticated("No valid auth token[5]"));
         }
 
-        // A read-only account has no write path over HTTP, so it must not gain
-        // one over gRPC either. Keyed on the service's declared `is_write`
-        // rather than on `allow_org_ingestion_token`, which only marks the OTLP
-        // services and would leave the internal ingest service uncovered.
-        // Enterprise defers to OpenFGA, exactly as the HTTP gate does.
+        // Keyed on `is_write`, not `allow_org_ingestion_token` — the latter
+        // marks only OTLP and would leave the internal ingest service uncovered.
         #[cfg(not(feature = "enterprise"))]
         if is_write && user.role.is_read_only() {
             log::warn!("Read only account {user_id} denied gRPC write");
@@ -168,8 +157,7 @@ mod tests {
 
     use super::*;
 
-    /// Registers a read-only Viewer in `default` and returns a request bearing
-    /// `authorization`/`organization` metadata for the given Basic credential.
+    /// Registers a Viewer in `default` and builds a request with that credential.
     #[cfg(not(feature = "enterprise"))]
     fn viewer_request(basic: &str) -> tonic::Request<()> {
         cache_instance_id("instance");
@@ -208,8 +196,7 @@ mod tests {
         request
     }
 
-    /// A read-only account is refused on a write service but still reaches the
-    /// read services, which is the whole point of the role.
+    /// Refused on write services, still allowed on read services.
     #[cfg(not(feature = "enterprise"))]
     #[tokio::test]
     async fn test_read_only_account_denied_on_write_service() {
@@ -221,10 +208,8 @@ mod tests {
         assert!(check_auth(viewer_request(basic)).is_ok());
     }
 
-    /// Authorization must not be decided before authentication: a wrong password
-    /// on a write service has to read as `unauthenticated`, never
-    /// `permission_denied` — the latter would confirm to an unauthenticated
-    /// caller that the account exists and is read only.
+    /// A wrong password must read as `unauthenticated`, not `permission_denied`,
+    /// which would confirm the account exists and is read only.
     #[cfg(not(feature = "enterprise"))]
     #[tokio::test]
     async fn test_bad_password_is_unauthenticated_not_permission_denied() {

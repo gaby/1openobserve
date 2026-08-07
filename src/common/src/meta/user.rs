@@ -174,13 +174,9 @@ pub fn get_roles() -> Vec<UserRole> {
     UserRole::iter().collect()
 }
 
-/// Roles an OSS deployment understands.
-///
-/// OSS has no OpenFGA, so the fine-grained roles (`Editor`, `User`, custom
-/// roles) are not offered — there is nothing to enforce them with. `Viewer` is
-/// the exception: it is a whole-org "read only" account, which the auth layer
-/// enforces on its own via the read-only route policy, so it is available in
-/// OSS as well.
+/// Roles an OSS deployment understands. The fine-grained roles need an
+/// authorization model OSS lacks; `Viewer` is offered because the auth layer
+/// enforces it through the read-only route policy.
 #[cfg(not(feature = "enterprise"))]
 pub fn get_roles() -> Vec<UserRole> {
     vec![
@@ -191,17 +187,9 @@ pub fn get_roles() -> Vec<UserRole> {
     ]
 }
 
-/// Collapse a *requested* role to what an OSS deployment can actually enforce.
-///
-/// This is the single rule behind every OSS role assignment. `Viewer` is
-/// honoured — the auth layer enforces it by itself through the read-only route
-/// policy — and everything else collapses to `Admin`, which is the
-/// long-standing OSS behaviour for roles it has no enforcement for.
-///
-/// Note what this deliberately does *not* do: it never elevates. A request
-/// asking for `Root` gets `Admin`, so the user-management endpoints cannot be
-/// used to mint a privileged account. Service accounts are unaffected because
-/// they are created through their own endpoint, which sets the role directly.
+/// Collapse a requested role to what OSS can enforce: `Viewer` is honoured,
+/// everything else becomes `Admin`. Never elevates — a request for `Root` gets
+/// `Admin`, so this path cannot mint a privileged account.
 #[cfg(not(feature = "enterprise"))]
 pub fn get_supported_role(requested: &UserRole) -> UserRole {
     if requested == &UserRole::Viewer {
@@ -513,8 +501,7 @@ mod tests {
 
     use super::*;
 
-    /// The read-only Viewer is assignable in OSS; the fine-grained roles, which
-    /// OSS has no enforcement for, are not offered.
+    /// Viewer is assignable in OSS; the fine-grained roles are not.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn test_oss_roles_include_viewer() {
@@ -525,14 +512,12 @@ mod tests {
         assert!(!roles.contains(&UserRole::User));
     }
 
-    /// `get_roles` (what OSS knows about) and `get_supported_role` (what OSS
-    /// will actually assign) must not drift apart, or a role reachable through
-    /// the API gets silently rewritten on save. Every listed role has to fall
-    /// into one of the two groups below, so adding one forces that decision.
+    /// `get_roles` and `get_supported_role` must not drift, or a role reachable
+    /// through the API gets silently rewritten on save.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn test_offered_roles_are_assignable() {
-        // Assignable through the users API, and preserved as asked.
+        // Assignable through the users API, preserved as asked.
         for role in [UserRole::Admin, UserRole::Viewer] {
             assert_eq!(
                 get_supported_role(&role),
@@ -540,17 +525,14 @@ mod tests {
                 "OSS offers {role} but would assign something else"
             );
         }
-        // Listed so existing accounts resolve, but never assignable through the
-        // users API: Root must not be mintable, and a service account gets its
-        // role from the service-account endpoints, not this path.
+        // Resolve for existing accounts, but never assignable here.
         for role in [UserRole::Root, UserRole::ServiceAccount] {
             assert_eq!(get_supported_role(&role), UserRole::Admin);
         }
         assert_eq!(get_roles().len(), 4, "a new OSS role needs a group above");
     }
 
-    /// A role request resolves to Viewer or Admin and nothing else — in
-    /// particular a request for Root must not elevate.
+    /// A role request resolves to Viewer or Admin and nothing else.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn test_get_supported_role() {
@@ -567,9 +549,8 @@ mod tests {
         }
     }
 
-    /// The role a client asks for on the wire ("viewer") has to survive the
-    /// string round-trip into `UserOrgRole`, which is what the user-management
-    /// endpoints actually parse.
+    /// The wire spelling ("viewer") must survive the round-trip into
+    /// `UserOrgRole`, which is what the user-management endpoints parse.
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn test_viewer_role_request_parses_in_oss() {
@@ -580,8 +561,7 @@ mod tests {
         assert_eq!(parsed.base_role, UserRole::Viewer);
         assert!(parsed.custom_role.is_none());
 
-        // A role OSS cannot enforce falls back to the default (Admin) and is
-        // carried along as a custom role, which OSS then rejects outright.
+        // An unenforceable role falls back to Admin, carried as a custom role.
         let parsed = UserOrgRole::from(&UserRoleRequest {
             role: "editor".to_string(),
             custom: None,
@@ -956,9 +936,6 @@ mod tests {
         // Non-enterprise mode should have specific roles
         #[cfg(not(feature = "enterprise"))]
         {
-            // Viewer is included because OSS enforces read-only accounts itself
-            // (see `super::read_only_routes`); the remaining fine-grained roles
-            // need an authorization model OSS does not have.
             assert_eq!(roles.len(), 4);
             assert!(roles.contains(&UserRole::Admin));
             assert!(roles.contains(&UserRole::Root));

@@ -525,6 +525,30 @@ mod tests {
         assert!(!roles.contains(&UserRole::User));
     }
 
+    /// `get_roles` (what OSS knows about) and `get_supported_role` (what OSS
+    /// will actually assign) must not drift apart, or a role reachable through
+    /// the API gets silently rewritten on save. Every listed role has to fall
+    /// into one of the two groups below, so adding one forces that decision.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_offered_roles_are_assignable() {
+        // Assignable through the users API, and preserved as asked.
+        for role in [UserRole::Admin, UserRole::Viewer] {
+            assert_eq!(
+                get_supported_role(&role),
+                role,
+                "OSS offers {role} but would assign something else"
+            );
+        }
+        // Listed so existing accounts resolve, but never assignable through the
+        // users API: Root must not be mintable, and a service account gets its
+        // role from the service-account endpoints, not this path.
+        for role in [UserRole::Root, UserRole::ServiceAccount] {
+            assert_eq!(get_supported_role(&role), UserRole::Admin);
+        }
+        assert_eq!(get_roles().len(), 4, "a new OSS role needs a group above");
+    }
+
     /// A role request resolves to Viewer or Admin and nothing else — in
     /// particular a request for Root must not elevate.
     #[cfg(not(feature = "enterprise"))]
@@ -932,10 +956,14 @@ mod tests {
         // Non-enterprise mode should have specific roles
         #[cfg(not(feature = "enterprise"))]
         {
-            assert_eq!(roles.len(), 3);
+            // Viewer is included because OSS enforces read-only accounts itself
+            // (see `super::read_only_routes`); the remaining fine-grained roles
+            // need an authorization model OSS does not have.
+            assert_eq!(roles.len(), 4);
             assert!(roles.contains(&UserRole::Admin));
             assert!(roles.contains(&UserRole::Root));
             assert!(roles.contains(&UserRole::ServiceAccount));
+            assert!(roles.contains(&UserRole::Viewer));
         }
 
         // Enterprise mode uses iterator over all roles

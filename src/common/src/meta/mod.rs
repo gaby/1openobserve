@@ -22,7 +22,11 @@ pub mod maxmind;
 pub mod middleware_data;
 pub mod organization;
 pub mod proxy;
+/// Read-only account policy is enforced only in OSS builds; enterprise defers
+/// to OpenFGA.
+#[cfg(not(feature = "enterprise"))]
 pub mod read_only_routes;
+pub(crate) mod route_match;
 pub mod saved_view;
 pub mod service;
 pub mod service_account;

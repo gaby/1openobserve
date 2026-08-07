@@ -295,15 +295,13 @@ pub async fn update(
     // every update — as this used to do — would silently promote a read-only
     // account to Admin the moment anyone edited its name or password.
     #[cfg(not(feature = "enterprise"))]
-    if let Some(role_request) = user.role.as_ref() {
-        let requested = role_request
-            .role
-            .parse::<UserRole>()
-            .unwrap_or(UserRole::Admin);
-        user.role = Some(UserRoleRequest {
-            role: get_supported_role(&requested).to_string(),
-            custom: None,
-        });
+    if let Some(role_request) = user.role.as_mut() {
+        // Resolved through `UserOrgRole::from`, the same conversion the create
+        // path and `core::users` use, so a role spelled "Viewer" resolves the
+        // same way here as it does there.
+        let requested = UserOrgRole::from(&*role_request).base_role;
+        role_request.role = get_supported_role(&requested).to_string();
+        role_request.custom = None;
     }
 
     let initiator_id = &user_email.user_id;
@@ -1230,23 +1228,5 @@ mod tests {
             .map(|r| r.value)
             .collect::<Vec<_>>();
         assert_eq!(values, vec!["admin".to_string(), "viewer".to_string()]);
-    }
-
-    #[cfg(not(feature = "enterprise"))]
-    #[test]
-    fn test_get_supported_role() {
-        // Viewer is the one non-admin role OSS can enforce on its own.
-        assert_eq!(get_supported_role(&UserRole::Viewer), UserRole::Viewer);
-        // Everything else collapses to Admin, as it always has in OSS —
-        // including Root, so these endpoints cannot mint a privileged account.
-        for role in [
-            UserRole::Admin,
-            UserRole::Editor,
-            UserRole::User,
-            UserRole::Root,
-            UserRole::ServiceAccount,
-        ] {
-            assert_eq!(get_supported_role(&role), UserRole::Admin);
-        }
     }
 }

@@ -39,7 +39,7 @@ use tonic::{
 
 use crate::{
     handler::grpc::{
-        auth::{check_auth, check_otlp_auth},
+        auth::{check_auth, check_otlp_auth, check_write_auth},
         flight::FlightServiceImpl,
         request::{
             event::Eventer,
@@ -152,7 +152,7 @@ async fn run_common(
     let trace_svc = otlp_authenticated(trace_svc);
     let logs_svc = otlp_authenticated(logs_svc);
     let query_cache_svc = authenticated(query_cache_svc);
-    let ingest_svc = authenticated(ingest_svc);
+    let ingest_svc = write_authenticated(ingest_svc);
     let streams_svc = authenticated(streams_svc);
     let flight_svc = authenticated(flight_svc);
     let node_svc = authenticated(node_svc);
@@ -251,6 +251,13 @@ type AuthInterceptor = fn(tonic::Request<()>) -> Result<tonic::Request<()>, toni
 
 fn authenticated<S>(service: S) -> InterceptedService<S, AuthInterceptor> {
     InterceptedService::new(service, check_auth)
+}
+
+/// For services that write data on the internal cluster credentials — a
+/// read-only account is refused, unlike the read services wrapped by
+/// [`authenticated`].
+fn write_authenticated<S>(service: S) -> InterceptedService<S, AuthInterceptor> {
+    InterceptedService::new(service, check_write_auth)
 }
 
 fn otlp_authenticated<S>(service: S) -> InterceptedService<S, AuthInterceptor> {

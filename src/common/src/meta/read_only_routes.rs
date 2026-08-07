@@ -41,29 +41,24 @@
 //! so segment 0 is `{org_id}`; an optional `/v2/` prefix is normalised away
 //! first, exactly like [`super::ingestion_routes`].
 
+/// `Subject` is the shared matcher's "must equal the caller-supplied subject"
+/// pattern; here the subject is always the caller's own email, so the table
+/// reads `SelfEmail`. This is what turns "update a user" into "update *my* user".
+use Seg::{Lit, Param, Subject as SelfEmail};
 use axum::http::Method;
 
-/// One segment of a declared route pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Seg {
-    /// A fixed path segment that must match exactly (e.g. `_search`).
-    Lit(&'static str),
-    /// A single path parameter — matches any one non-empty segment
-    /// (`{org_id}`, `{stream_name}`, `{alert_id}`, ...).
-    Param,
-    /// A single path parameter that must equal the caller's own email. This is
-    /// what turns "update a user" into "update *my* user".
-    SelfEmail,
-}
+use super::route_match::{self, Seg};
 
-use Seg::{Lit, Param, SelfEmail};
+/// The user-facing reason a read-only account is refused. Lives here, next to
+/// the policy it describes, because both the HTTP and gRPC entry points report it.
+pub const READ_ONLY_DENIED: &str = "Read only account: this operation is not permitted";
 
 /// A route a read-only account may reach despite its write-ish HTTP method.
 struct ReadOnlyRoute {
     /// Segment patterns, starting at `{org_id}` (index 0).
     segments: &'static [Seg],
-    /// HTTP methods (as `Method::as_str()` values) this row applies to.
-    methods: &'static [&'static str],
+    /// The HTTP method (as `Method::as_str()`) this row applies to.
+    method: &'static str,
 }
 
 /// The authoritative table of write-method routes that a read-only account may
@@ -79,52 +74,52 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
     // `/{org}/_search`
     ReadOnlyRoute {
         segments: &[Param, Lit("_search")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_search_partition`
     ReadOnlyRoute {
         segments: &[Param, Lit("_search_partition")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_search_stream`
     ReadOnlyRoute {
         segments: &[Param, Lit("_search_stream")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_values_stream`
     ReadOnlyRoute {
         segments: &[Param, Lit("_values_stream")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_search_multi`
     ReadOnlyRoute {
         segments: &[Param, Lit("_search_multi")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_search_multi_stream`
     ReadOnlyRoute {
         segments: &[Param, Lit("_search_multi_stream")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_search_partition_multi`
     ReadOnlyRoute {
         segments: &[Param, Lit("_search_partition_multi")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/_search_history` — reads the caller's own past searches.
     ReadOnlyRoute {
         segments: &[Param, Lit("_search_history")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/result_schema` — resolves the result schema of a query.
     ReadOnlyRoute {
         segments: &[Param, Lit("result_schema")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/{stream}/_around` — the v2 (POST) form of the context view.
     ReadOnlyRoute {
         segments: &[Param, Param, Lit("_around")],
-        methods: &["POST"],
+        method: "POST",
     },
     // ---- PromQL: the Prometheus HTTP API offers POST forms of its read
     // endpoints so long queries are not capped by URL length ----
@@ -137,7 +132,7 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             Lit("v1"),
             Lit("query"),
         ],
-        methods: &["POST"],
+        method: "POST",
     },
     ReadOnlyRoute {
         segments: &[
@@ -147,7 +142,7 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             Lit("v1"),
             Lit("query_range"),
         ],
-        methods: &["POST"],
+        method: "POST",
     },
     ReadOnlyRoute {
         segments: &[
@@ -157,7 +152,7 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             Lit("v1"),
             Lit("query_exemplars"),
         ],
-        methods: &["POST"],
+        method: "POST",
     },
     ReadOnlyRoute {
         segments: &[
@@ -167,7 +162,7 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             Lit("v1"),
             Lit("series"),
         ],
-        methods: &["POST"],
+        method: "POST",
     },
     ReadOnlyRoute {
         segments: &[
@@ -177,7 +172,7 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             Lit("v1"),
             Lit("labels"),
         ],
-        methods: &["POST"],
+        method: "POST",
     },
     ReadOnlyRoute {
         segments: &[
@@ -187,20 +182,20 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             Lit("v1"),
             Lit("format_query"),
         ],
-        methods: &["POST"],
+        method: "POST",
     },
     // ---- Other reads that take a body ----
     // `/v2/{org}/alerts/{alert_id}/export` — returns the alert definition the
     // caller can already GET; the `/v2/` prefix is normalised away first.
     ReadOnlyRoute {
         segments: &[Param, Lit("alerts"), Param, Lit("export")],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/sourcemaps/stacktrace` — symbolicates a stack trace against
     // already-stored source maps.
     ReadOnlyRoute {
         segments: &[Param, Lit("sourcemaps"), Lit("stacktrace")],
-        methods: &["POST"],
+        method: "POST",
     },
     // ---- Self-service: maintaining one's own account ----
     // `/{org}/users/{own_email}` — change own name/password. A read-only
@@ -208,12 +203,12 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
     // separately refuses self role upgrades.
     ReadOnlyRoute {
         segments: &[Param, Lit("users"), SelfEmail],
-        methods: &["PUT"],
+        method: "PUT",
     },
     // `/{org}/settings/v2/user/{own_email}` — own UI preferences.
     ReadOnlyRoute {
         segments: &[Param, Lit("settings"), Lit("v2"), Lit("user"), SelfEmail],
-        methods: &["POST"],
+        method: "POST",
     },
     // `/{org}/settings/v2/user/{own_email}/{key}` — drop one own preference.
     ReadOnlyRoute {
@@ -225,29 +220,13 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
             SelfEmail,
             Param,
         ],
-        methods: &["DELETE"],
+        method: "DELETE",
     },
 ];
-
-/// The `/v2/...` API prefix, stripped before matching so `/v2/{org}/alerts/...`
-/// classifies identically to `/{org}/alerts/...`.
-const V2_API_PREFIX: &str = "v2";
 
 /// HTTP methods that cannot mutate state and are therefore always allowed.
 fn is_safe_method(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-}
-
-/// Does this segment pattern list match these path segments?
-fn segments_match(patterns: &[Seg], columns: &[&str], user_email: &str) -> bool {
-    if patterns.len() != columns.len() {
-        return false;
-    }
-    patterns.iter().zip(columns).all(|(pat, col)| match pat {
-        Seg::Lit(lit) => col == lit,
-        Seg::Param => !col.is_empty(),
-        Seg::SelfEmail => is_self_email(col, user_email),
-    })
 }
 
 /// Does this path segment name the caller's own account?
@@ -284,24 +263,15 @@ pub fn is_request_allowed(method: &Method, path: &str, user_email: &str) -> bool
         return true;
     }
 
-    let path = path.strip_prefix('/').unwrap_or(path);
-    // Normalise the optional `/v2/{org}/...` prefix to `/{org}/...`.
-    let path = path
-        .strip_prefix(V2_API_PREFIX)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(path);
-
+    let path = route_match::strip_api_prefixes(path);
     let method = method.as_str();
-
-    // A single trailing empty segment (trailing slash) is dropped so
-    // `.../_search/` == `.../_search`.
-    let mut columns: Vec<&str> = path.split('/').collect();
-    if columns.len() > 1 && columns.last() == Some(&"") {
-        columns.pop();
-    }
+    let columns = route_match::columns(path);
 
     READ_ONLY_ROUTES.iter().any(|route| {
-        route.methods.contains(&method) && segments_match(route.segments, &columns, user_email)
+        route.method == method
+            && route_match::segments_match(route.segments, &columns, |col| {
+                is_self_email(col, user_email)
+            })
     })
 }
 

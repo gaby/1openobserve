@@ -35,17 +35,7 @@
 
 use axum::http::Method;
 
-/// One segment of a declared route pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Seg {
-    /// A fixed path segment that must match exactly (e.g. `_bulk`, `traces`).
-    Lit(&'static str),
-    /// A single path parameter — matches any one non-empty segment
-    /// (`{org_id}`, `{stream_name}`, `{name}`, ...). It deliberately does NOT
-    /// match an ingestion keyword by accident because matching is positional:
-    /// a stream literally named `traces` only ever lands in a `Param` slot.
-    Param,
-}
+use super::route_match::{self, Seg};
 
 /// What an ingestion-facing route is, for authorization purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,22 +210,6 @@ static INGESTION_ROUTES: &[IngestionRoute] = &[
     },
 ];
 
-/// The `/v2/...` API prefix, stripped before matching so `/v2/{org}/_bulk`
-/// classifies identically to `/{org}/_bulk`.
-const V2_API_PREFIX: &str = "v2";
-
-/// Does this segment pattern list match these path segments?
-fn segments_match(patterns: &[Seg], columns: &[&str]) -> bool {
-    if patterns.len() != columns.len() {
-        return false;
-    }
-    patterns.iter().zip(columns).all(|(pat, col)| match pat {
-        Seg::Lit(lit) => col == lit,
-        // A param matches any single non-empty segment.
-        Seg::Param => !col.is_empty(),
-    })
-}
-
 /// Classify a request against the ingestion-route table.
 ///
 /// `path` is the request path with the `/api/` and base-uri prefix already
@@ -250,13 +224,7 @@ fn segments_match(patterns: &[Seg], columns: &[&str]) -> bool {
 /// everything else — including data-read routes such as `.../traces/latest`,
 /// which are intentionally not in the table.
 pub fn classify(method: &Method, path: &str) -> Option<IngestionKind> {
-    let path = path.strip_prefix('/').unwrap_or(path);
-    // Normalise the optional `/v2/{org}/...` prefix to `/{org}/...`.
-    let path = path
-        .strip_prefix(V2_API_PREFIX)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(path);
-
+    let path = route_match::strip_api_prefixes(path);
     let method = method.as_str();
 
     // The ES root version ping is the sole ingestion route registered with a
@@ -271,16 +239,16 @@ pub fn classify(method: &Method, path: &str) -> Option<IngestionKind> {
         return Some(IngestionKind::EsHandshakeRead);
     }
 
-    // Everything else matches on exact segment shape. A single trailing empty
-    // segment (trailing slash) is dropped so `.../_bulk/` == `.../_bulk`.
-    let mut columns: Vec<&str> = path.split('/').collect();
-    if columns.len() > 1 && columns.last() == Some(&"") {
-        columns.pop();
-    }
+    // Everything else matches on exact segment shape.
+    let columns = route_match::columns(path);
 
     INGESTION_ROUTES
         .iter()
-        .find(|route| route.methods.contains(&method) && segments_match(route.segments, &columns))
+        .find(|route| {
+            route.methods.contains(&method)
+                // The ingestion table declares no subject-constrained routes.
+                && route_match::segments_match(route.segments, &columns, |_| false)
+        })
         .map(|route| route.kind)
 }
 

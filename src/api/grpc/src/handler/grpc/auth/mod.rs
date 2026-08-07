@@ -22,7 +22,17 @@ use openobserve_core::auth::get_hash;
 use tonic::{Request, Status, metadata::MetadataValue};
 
 pub fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
-    check_auth_inner(req, false)
+    check_auth_inner(req, false, false)
+}
+
+/// Authenticate a gRPC service that writes data, on the internal cluster
+/// credential set.
+///
+/// Same as [`check_auth`], but marked as a write so a read-only account cannot
+/// reach it. Kept separate from [`check_otlp_auth`] because these services do
+/// *not* accept org ingestion tokens.
+pub fn check_write_auth(req: Request<()>) -> Result<Request<()>, Status> {
+    check_auth_inner(req, false, true)
 }
 
 /// Authenticate external OTLP ingestion requests.
@@ -31,12 +41,13 @@ pub fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
 /// logs, metrics, and traces services. Internal cluster RPCs continue to use
 /// [`check_auth`], so an ingestion token cannot authorize query or node APIs.
 pub fn check_otlp_auth(req: Request<()>) -> Result<Request<()>, Status> {
-    check_auth_inner(req, true)
+    check_auth_inner(req, true, true)
 }
 
 fn check_auth_inner(
     req: Request<()>,
     allow_org_ingestion_token: bool,
+    is_write: bool,
 ) -> Result<Request<()>, Status> {
     let cfg = config::get_config();
     let metadata = req.metadata();
@@ -108,14 +119,16 @@ fn check_auth_inner(
             return Err(Status::unauthenticated("No valid auth token[4]"));
         };
 
-        // `allow_org_ingestion_token` marks the OTLP logs/metrics/traces
-        // services — i.e. this request is an ingest. A read-only account has no
-        // write path over HTTP, so it must not gain one over gRPC either.
-        // Enterprise builds also run their own RBAC on top of this.
-        if allow_org_ingestion_token && user.role.is_read_only() {
-            log::warn!("Read only account attempted OTLP gRPC ingestion: {user_id}");
+        // A read-only account has no write path over HTTP, so it must not gain
+        // one over gRPC either. Keyed on the service's declared `is_write`
+        // rather than on `allow_org_ingestion_token`, which only marks the OTLP
+        // services and would leave the internal ingest service uncovered.
+        // Enterprise defers to OpenFGA, exactly as the HTTP gate does.
+        #[cfg(not(feature = "enterprise"))]
+        if is_write && user.role.is_read_only() {
+            log::warn!("Read only account {user_id} denied gRPC write");
             return Err(Status::permission_denied(
-                "Read only account: this operation is not permitted",
+                common::meta::read_only_routes::READ_ONLY_DENIED,
             ));
         }
 

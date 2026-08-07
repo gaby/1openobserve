@@ -196,6 +196,19 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
     },
 ];
 
+/// Routes refused to a read-only account despite a safe method, because they
+/// hand back a credential that would let the caller write. Checked before the
+/// safe-method allowance below.
+static CREDENTIAL_ROUTES: &[ReadOnlyRoute] = &[
+    // `/{org}/passcode` — returns the org-wide ingestion token unmasked, and
+    // ingesting with that token authenticates with no role at all, so the
+    // read-only gate would never see the write.
+    ReadOnlyRoute {
+        segments: &[Param, Lit("passcode")],
+        method: "GET",
+    },
+];
+
 /// HTTP methods that cannot mutate state and are therefore always allowed.
 fn is_safe_method(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
@@ -218,25 +231,74 @@ fn is_self_email(segment: &str, user_email: &str) -> bool {
 /// `user_email` is the caller, used only by the self-service rows. A `false`
 /// becomes a `403`.
 pub fn is_request_allowed(method: &Method, path: &str, user_email: &str) -> bool {
+    let matches = |routes: &[ReadOnlyRoute], method: &str, columns: &[&str]| {
+        routes.iter().any(|route| {
+            route.method == method
+                && route_match::segments_match(route.segments, columns, |col| {
+                    is_self_email(col, user_email)
+                })
+        })
+    };
+    let method_str = method.as_str();
+    let candidates = route_match::candidate_columns(path);
+
+    if candidates
+        .iter()
+        .any(|columns| matches(CREDENTIAL_ROUTES, method_str, columns))
+    {
+        return false;
+    }
     if is_safe_method(method) {
         return true;
     }
 
-    let path = route_match::strip_api_prefixes(path);
-    let method = method.as_str();
-    let columns = route_match::columns(path);
-
-    READ_ONLY_ROUTES.iter().any(|route| {
-        route.method == method
-            && route_match::segments_match(route.segments, &columns, |col| {
-                is_self_email(col, user_email)
-            })
-    })
+    candidates
+        .iter()
+        .any(|columns| matches(READ_ONLY_ROUTES, method_str, columns))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GET /{org}/passcode` returns the org-wide ingestion token unmasked, and
+    /// that token authenticates with no role, so the gate would never see the
+    /// writes it buys. It must not ride the safe-method allowance.
+    #[test]
+    fn credential_bearing_reads_are_refused() {
+        let viewer = "viewer@example.com";
+        assert!(!is_request_allowed(
+            &Method::GET,
+            "default/passcode",
+            viewer
+        ));
+        assert!(!is_request_allowed(
+            &Method::GET,
+            "/v2/default/passcode",
+            viewer
+        ));
+        // Rotating it was already refused as a write method.
+        assert!(!is_request_allowed(
+            &Method::PUT,
+            "default/passcode",
+            viewer
+        ));
+        // Ordinary reads are untouched.
+        assert!(is_request_allowed(
+            &Method::GET,
+            "default/dashboards",
+            viewer
+        ));
+    }
+
+    /// An org literally named `v2` must still reach the read-only routes.
+    #[test]
+    fn an_org_named_v2_is_not_mistaken_for_the_api_prefix() {
+        let viewer = "viewer@example.com";
+        assert!(is_request_allowed(&Method::POST, "v2/_search", viewer));
+        assert!(!is_request_allowed(&Method::GET, "v2/passcode", viewer));
+        assert!(!is_request_allowed(&Method::POST, "v2/dashboards", viewer));
+    }
 
     const ME: &str = "viewer@example.com";
 

@@ -50,6 +50,20 @@ pub(crate) fn columns(path: &str) -> Vec<&str> {
     path.strip_suffix('/').unwrap_or(path).split('/').collect()
 }
 
+/// Segment lists to try for `path`. Usually one, but `/v2/_search` is genuinely
+/// ambiguous — the `/v2/` API prefix on org `_search`, or an org literally named
+/// `v2`, which nothing reserves — so both readings are offered. A row matches if
+/// either does.
+pub(crate) fn candidate_columns(path: &str) -> Vec<Vec<&str>> {
+    let unprefixed = path.strip_prefix('/').unwrap_or(path);
+    let stripped = strip_api_prefixes(path);
+    let mut candidates = vec![columns(stripped)];
+    if stripped != unprefixed {
+        candidates.push(columns(unprefixed));
+    }
+    candidates
+}
+
 /// `subject_matches` decides [`Seg::Subject`] segments; pass `|_| false` from
 /// tables with no subject-constrained routes.
 pub(crate) fn segments_match(
@@ -78,6 +92,24 @@ mod tests {
         assert_eq!(strip_api_prefixes("/v2/default/_bulk"), "default/_bulk");
         // `v2` as an org name is not a prefix.
         assert_eq!(strip_api_prefixes("/v2suffix/_bulk"), "v2suffix/_bulk");
+    }
+
+    /// An org may be literally named `v2`, so `/v2/_search` has to be offered
+    /// both as the versioned prefix and as that org's unversioned route.
+    #[test]
+    fn offers_both_readings_of_a_v2_prefix() {
+        assert_eq!(
+            candidate_columns("/default/_search"),
+            vec![vec!["default", "_search"]]
+        );
+        assert_eq!(
+            candidate_columns("/v2/_search"),
+            vec![vec!["_search"], vec!["v2", "_search"]]
+        );
+        assert_eq!(
+            candidate_columns("/v2/default/_search"),
+            vec![vec!["default", "_search"], vec!["v2", "default", "_search"]]
+        );
     }
 
     #[test]

@@ -267,6 +267,13 @@ pub async fn update_user(
     // May the initiator change a role that is not their own? The neighbouring
     // `allow_password_update` covers only passwords and tokens.
     let mut allow_role_update = false;
+    // Only enforce `allow_role_update` where nothing else authorizes the change.
+    // With OpenFGA on, a delegated role manager has already passed the
+    // permission middleware and need not be an Admin.
+    #[cfg(not(feature = "enterprise"))]
+    let enforce_role_update = true;
+    #[cfg(feature = "enterprise")]
+    let enforce_role_update = !get_openfga_config().enabled;
     #[cfg(feature = "cloud")]
     let is_cloud = true;
     #[cfg(not(feature = "cloud"))]
@@ -430,7 +437,8 @@ pub async fn update_user(
                         message = "Root user role cannot be changed";
                     } else if update_mode.is_self_update() && local_user.role < new_user.role {
                         message = "Self role cannot be upgraded";
-                    } else if !update_mode.is_self_update()
+                    } else if enforce_role_update
+                        && !update_mode.is_self_update()
                         && !allow_role_update
                         && local_user.role.ne(&new_user.role)
                     {

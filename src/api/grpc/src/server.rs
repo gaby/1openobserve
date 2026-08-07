@@ -145,13 +145,13 @@ async fn run_common(
         .max_decoding_message_size(cfg.grpc.max_message_size * 1024 * 1024)
         .max_encoding_message_size(cfg.grpc.max_message_size * 1024 * 1024);
 
-    let event_svc = authenticated(event_svc);
+    let event_svc = write_authenticated(event_svc);
     let search_svc = authenticated(search_svc);
     let metrics_svc = authenticated(metrics_svc);
     let metrics_ingest_svc = otlp_authenticated(metrics_ingest_svc);
     let trace_svc = otlp_authenticated(trace_svc);
     let logs_svc = otlp_authenticated(logs_svc);
-    let query_cache_svc = authenticated(query_cache_svc);
+    let query_cache_svc = write_authenticated(query_cache_svc);
     let ingest_svc = write_authenticated(ingest_svc);
     let streams_svc = authenticated(streams_svc);
     let flight_svc = authenticated(flight_svc);

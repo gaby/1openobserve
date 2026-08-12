@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use common::utils::grpc_auth::{authenticated_org, bind_org};
 use config::{
     meta::{otlp::OtlpRequestType, stream::StreamType},
     metrics,
@@ -38,7 +39,9 @@ impl Ingest for Ingester {
         request: Request<IngestionRequest>,
     ) -> Result<Response<IngestionResponse>, Status> {
         let start = std::time::Instant::now();
-        let req = request.into_inner();
+        let authenticated_org = authenticated_org(&request)?;
+        let mut req = request.into_inner();
+        bind_org(&mut req.org_id, authenticated_org);
         let org_id = req.org_id;
         let stream_type: StreamType = req.stream_type.into();
         let stream_name = req.stream_name;

@@ -15,6 +15,7 @@
 
 use std::pin::Pin;
 
+use common::utils::grpc_auth::{authenticated_org, bind_org};
 use config::{meta::stream::StreamType, metrics};
 use futures::Stream;
 use infra::errors;
@@ -49,7 +50,10 @@ impl Metrics for MetricsQuerier {
             global::get_text_map_propagator(|prop| prop.extract(&MetadataMap(req.metadata())));
         let _ = tracing::Span::current().set_parent(parent_cx);
 
-        let req: &MetricsQueryRequest = req.get_ref();
+        let authenticated_org = authenticated_org(&req)?;
+        let mut owned_req = req.into_inner();
+        bind_org(&mut owned_req.org_id, authenticated_org);
+        let req: &MetricsQueryRequest = &owned_req;
         let org_id = &req.org_id;
         let stream_type = StreamType::Metrics.as_str();
 
@@ -104,7 +108,9 @@ impl Metrics for MetricsQuerier {
     ) -> Result<Response<Self::DataStream>, Status> {
         let cap = std::cmp::max(2, config::get_config().limit.cpu_num);
         let (tx, rx) = mpsc::channel::<Result<MetricsQueryResponse, Status>>(cap);
+        let authenticated_org = authenticated_org(&req)?;
         let mut req: MetricsQueryRequest = req.into_inner();
+        bind_org(&mut req.org_id, authenticated_org);
         req.query.as_mut().unwrap().query_data = true;
 
         log::info!(

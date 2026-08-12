@@ -196,15 +196,32 @@ static READ_ONLY_ROUTES: &[ReadOnlyRoute] = &[
     },
 ];
 
-/// Routes refused to a read-only account despite a safe method, because they
-/// hand back a credential that would let the caller write. Checked before the
-/// safe-method allowance below.
-static CREDENTIAL_ROUTES: &[ReadOnlyRoute] = &[
+/// Routes refused despite a safe method, checked before the safe-method
+/// allowance. `GET` is only presumed harmless — where a handler breaks that
+/// presumption it needs a row here.
+static SAFE_METHOD_EXCEPTIONS: &[ReadOnlyRoute] = &[
+    // ---- Hands back a credential that buys a write ----
     // `/{org}/passcode` — returns the org-wide ingestion token unmasked, and
     // ingesting with that token authenticates with no role at all, so the
     // read-only gate would never see the write.
     ReadOnlyRoute {
         segments: &[Param, Lit("passcode")],
+        method: "GET",
+    },
+    // ---- Mutates server state behind a GET ----
+    // These are node routes, not org routes, so segment 0 is the literal
+    // `node`. Unlike `/config/reload`, none of them checks the caller's role.
+    // `/node/reload?module=all` rebuilds every cache on the node.
+    ReadOnlyRoute {
+        segments: &[Lit("node"), Lit("reload")],
+        method: "GET",
+    },
+    ReadOnlyRoute {
+        segments: &[Lit("node"), Lit("refresh_nodes_list")],
+        method: "GET",
+    },
+    ReadOnlyRoute {
+        segments: &[Lit("node"), Lit("refresh_user_sessions")],
         method: "GET",
     },
 ];
@@ -244,7 +261,7 @@ pub fn is_request_allowed(method: &Method, path: &str, user_email: &str) -> bool
 
     if candidates
         .iter()
-        .any(|columns| matches(CREDENTIAL_ROUTES, method_str, columns))
+        .any(|columns| matches(SAFE_METHOD_EXCEPTIONS, method_str, columns))
     {
         return false;
     }
@@ -289,6 +306,29 @@ mod tests {
             "default/dashboards",
             viewer
         ));
+    }
+
+    /// Node routes that rebuild caches behind a `GET`. They carry no role check
+    /// of their own, unlike `/config/reload`, which is root-only.
+    #[test]
+    fn cache_mutating_gets_are_refused() {
+        let viewer = "viewer@example.com";
+        assert!(!is_request_allowed(&Method::GET, "node/reload", viewer));
+        assert!(!is_request_allowed(&Method::GET, "/node/reload", viewer));
+        assert!(!is_request_allowed(
+            &Method::GET,
+            "node/refresh_nodes_list",
+            viewer
+        ));
+        assert!(!is_request_allowed(
+            &Method::GET,
+            "node/refresh_user_sessions",
+            viewer
+        ));
+        // The genuinely read-only node routes are untouched.
+        assert!(is_request_allowed(&Method::GET, "node/status", viewer));
+        assert!(is_request_allowed(&Method::GET, "node/list", viewer));
+        assert!(is_request_allowed(&Method::GET, "node/metrics", viewer));
     }
 
     /// An org literally named `v2` must still reach the read-only routes.
